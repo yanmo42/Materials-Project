@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # pdf_scraper
-
+# 
 """
 Test with:
   pdf_scraper.py --email you@example.com --max 60 --threads 12
