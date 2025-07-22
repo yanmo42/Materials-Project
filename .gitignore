@@ -3,4 +3,5 @@
 !total_papers_available.py
 !pdfjson_conv.py
 !pdf_scraper_threaded.py
+!collect_urls.py
 !.gitignore
