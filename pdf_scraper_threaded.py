@@ -11,7 +11,7 @@ import argparse, hashlib, queue, threading, time, re, urllib.parse as urlparse
 from pathlib import Path
 import requests
 from tqdm import tqdm
-
+from selenium.webdriver.chrome.service import Service
 
 # -------------------------------------------------------------------- #
 # constants
@@ -109,10 +109,14 @@ COMMON_PDF_BUTTONS = [
 ]
 
 
-def make_driver(download_dir: Path, driver_path: str, timeout=45, thread_id=0):
+def make_driver(download_dir: Path, driver_path: str, timeout=45, thread_id=0, headless=False):
     opts = uc.ChromeOptions()
     # Keep visible for now (headless often blocks downloads)
-    # opts.add_argument("--headless=new")
+    
+    if headless:
+        opts.add_argument("--headless=new")
+
+
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1200,1000")
     # Offset windows so they don't overlap completely
@@ -125,7 +129,11 @@ def make_driver(download_dir: Path, driver_path: str, timeout=45, thread_id=0):
         "download.prompt_for_download": False,
         "plugins.always_open_pdf_externally": True,
     })
-    drv = uc.Chrome(options=opts, driver_executable_path=driver_path)
+
+    service = Service(executable_path=driver_path)
+    drv = uc.Chrome(service=service, options=opts)
+
+
     drv.set_page_load_timeout(timeout)
     drv.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": UA})
     drv.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Referer": "https://doi.org"}})
@@ -177,8 +185,10 @@ def selenium_worker(work_queue: queue.Queue, result_queue: queue.Queue,
     try:
         driver = make_driver(thread_tmp_dir, driver_path, 
                            timeout=30 if args.slow else 15, 
-                           thread_id=thread_id)
+                           thread_id=thread_id,
+                           headless=args.headless)
         
+
         while True:
             try:
                 # Get work item with timeout to avoid hanging
@@ -198,7 +208,8 @@ def selenium_worker(work_queue: queue.Queue, result_queue: queue.Queue,
                 for url in urls:
                     try:
                         driver.get(url)
-                        time.sleep(1.5)
+                        # time.sleep(1.5)
+                        time.sleep(0.5 if not args.slow else 1.5)
                         title = driver.title.strip()
                         url_short = url if len(url) <= 100 else url[:97] + "…"
 
@@ -222,7 +233,7 @@ def selenium_worker(work_queue: queue.Queue, result_queue: queue.Queue,
                         button_clicked = click_common_pdf_buttons(driver)
                         if button_clicked:
                             attempts.append("🖱️ Clicked PDF download button")
-                        time.sleep(2)
+                        time.sleep(0.5 if not args.slow else 2)
 
                         # 2) examine downloads directory (thread-specific)
                         for _ in range(poll):
@@ -310,6 +321,8 @@ def main():
     ap.set_defaults(rescue=True)
     ap.add_argument("--slow", action="store_true", help="poll longer (useful for flaky sites)")
     ap.add_argument("--verbose", "-v", action="store_true", help="show page titles and extra details")
+    ap.add_argument("--jobs-file", help="JSONL file of pre-collected (doi, year, urls) tuples")
+    ap.add_argument("--headless", action="store_true", help="run all Selenium browsers in headless mode (may affect downloads)")
     args = ap.parse_args()
 
     OUT_DIR.mkdir(exist_ok=True)
@@ -318,28 +331,65 @@ def main():
 
     sess = requests.Session(); sess.headers["User-Agent"] = "oa-sel 1.5"
 
-    # --- fetch works list ---
-    jobs, scanned, cursor = [], 0, "*"
-    print("🔎  Collecting DOIs + OA URLs …")
+   # --- load jobs ---
+    if args.jobs_file:
+        import json
+        from pathlib import Path
 
-    while scanned < args.max:
-        js = sess.get(OPENALEX, params={"search": "ferroelectric", "filter": "open_access.is_oa:true", "per-page": 200, "cursor": cursor}, timeout=40).json()
-        for work in js["results"]:
-            if scanned >= args.max: break
-            scanned += 1
-            doi = work.get("doi"); year = work.get("publication_year") or "na"
-            if not doi: continue
-            sha = pdf_name(doi)[:-4].upper()
-            if tried_before(sha): continue
-            upw = sess.get(UNPAYWALL.format(doi), params={"email": args.email}, timeout=15)
-            if upw.status_code != 200: continue
-            urls = candidate_urls(upw.json())
-            if urls: jobs.append((doi, year, urls))
-        cursor = js["meta"]["next_cursor"]
-        if not cursor: break
+            # 1) One-time scan of already-downloaded PDFs and .fail markers
+        existing = {
+                p.stem
+                for p in OUT_DIR.glob("**/*.pdf")
+            } | {
+                f.stem
+                for f in FAIL_DIR.glob("**/*.fail")
+            }
 
-    print(f"•  {len(jobs)} works with candidate URLs")
-    if not jobs: return
+        # 2) Load & filter the jobs.jsonl
+        jobs = []
+        print(f"🔎  Loading jobs from {args.jobs_file} …")
+        with Path(args.jobs_file).open() as fin:
+            for line in fin:
+                rec = json.loads(line)
+                doi, year, urls = rec["doi"], rec["year"], rec["urls"]
+                sha = pdf_name(doi)[:-4].upper()
+                if sha in existing:
+                    continue
+                jobs.append((doi, year, urls))
+
+
+        scanned = len(jobs)
+        print(f"• {scanned} works loaded from jobs file")
+
+        if not jobs:
+            print("Nothing new to download – exiting.")
+            return
+    
+    
+    else:
+        #OG logic
+        jobs, scanned, cursor = [], 0, "*"
+        print("🔎  Collecting DOIs + OA URLs …")
+
+        while scanned < args.max:
+            js = sess.get(OPENALEX, params={"search": "ferroelectric", "filter": "open_access.is_oa:true", "per-page": 200, "cursor": cursor}, timeout=40).json()
+            for work in js["results"]:
+                if scanned >= args.max: break
+                scanned += 1
+                doi = work.get("doi"); year = work.get("publication_year") or "na"
+                if not doi: continue
+                sha = pdf_name(doi)[:-4].upper()
+                if tried_before(sha): continue
+                upw = sess.get(UNPAYWALL.format(doi), params={"email": args.email}, timeout=15)
+                if upw.status_code != 200: continue
+                urls = candidate_urls(upw.json())
+                if urls: jobs.append((doi, year, urls))
+            cursor = js["meta"]["next_cursor"]
+            if not cursor: break
+
+        print(f"•  {len(jobs)} works with candidate URLs")
+        if not jobs: return
+
 
     # --- direct pass ---
     stats = {"ok": 0, "miss": 0}; bar = tqdm(total=len(jobs), unit="pdf", desc="DIRECT", ncols=80)
