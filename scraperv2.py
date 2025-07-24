@@ -32,6 +32,9 @@ HARDBLOCK = {"pubs.acs.org", "onlinelibrary.wiley.com",
 
 PDF_RE = re.compile(r"https?://[^\"'<> ]+\.pdf(?:\?[^\"'<> ]*)?", re.I)
 
+# Global lock for driver initialization
+DRIVER_INIT_LOCK = threading.Lock()
+
 # -------------------------------------------------------------------- #
 # helpers
 # -------------------------------------------------------------------- #
@@ -110,35 +113,76 @@ COMMON_PDF_BUTTONS = [
 
 
 def make_driver(download_dir: Path, driver_path: str, timeout=45, thread_id=0, headless=False):
+    """Thread-safe driver creation with initialization lock"""
     opts = uc.ChromeOptions()
-    # Keep visible for now (headless often blocks downloads)
     
     if headless:
         opts.add_argument("--headless=new")
 
-
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-dev-shm-usage")  # Helps with resource conflicts
+    opts.add_argument("--no-sandbox")  # May help with Windows permissions
+    opts.add_argument("--disable-web-security")  # Additional Windows compatibility
     opts.add_argument("--window-size=1200,1000")
+    
     # Offset windows so they don't overlap completely
     x_offset = (thread_id % 3) * 400
     y_offset = (thread_id // 3) * 300
     opts.add_argument(f"--window-position={x_offset},{y_offset}")
     
+    # Create user data directory in a more Windows-friendly location
+    import tempfile
+    import os
+    
+    # Use system temp directory instead of project directory
+    temp_base = Path(tempfile.gettempdir()) / "pdf_scraper_chrome"
+    temp_base.mkdir(exist_ok=True, parents=True)
+    
+    user_data_dir = temp_base / f"profile_{thread_id}_{os.getpid()}"
+    user_data_dir.mkdir(exist_ok=True, parents=True)
+    
+    # Ensure Windows can access the directory
+    try:
+        import stat
+        os.chmod(user_data_dir, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+    except Exception:
+        pass  # Ignore if chmod fails
+    
+    opts.add_argument(f"--user-data-dir={user_data_dir}")
+    
+    # Make download directory Windows-compatible
+    download_dir.mkdir(exist_ok=True, parents=True)
+    try:
+        os.chmod(download_dir, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+    except Exception:
+        pass
+    
     opts.add_experimental_option("prefs", {
-        "download.default_directory": str(download_dir),
+        "download.default_directory": str(download_dir.resolve()),  # Use absolute path
         "download.prompt_for_download": False,
         "plugins.always_open_pdf_externally": True,
     })
 
-    service = Service(executable_path=driver_path)
-    drv = uc.Chrome(service=service, options=opts)
-
+    # Thread-safe driver initialization
+    with DRIVER_INIT_LOCK:
+        try:
+            service = Service(executable_path=driver_path)
+            drv = uc.Chrome(service=service, options=opts, version_main=None)
+            # Small delay to prevent rapid-fire initialization conflicts
+            time.sleep(0.5)
+        except Exception as e:
+            # If undetected_chromedriver fails, try a longer delay and retry once
+            time.sleep(2)
+            try:
+                drv = uc.Chrome(service=service, options=opts, version_main=None)
+            except Exception as e2:
+                raise Exception(f"Failed to initialize driver after retry: {e2}")
 
     drv.set_page_load_timeout(timeout)
     drv.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": UA})
     drv.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Referer": "https://doi.org"}})
-    drv.execute_cdp_cmd("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": str(download_dir)})
-    return drv
+    drv.execute_cdp_cmd("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": str(download_dir.resolve())})
+    return drv, user_data_dir  # Return the profile directory for cleanup
 
 
 # ---------------- Selenium helpers ----------------
@@ -179,11 +223,15 @@ def selenium_worker(work_queue: queue.Queue, result_queue: queue.Queue,
     """Worker function for parallel Selenium processing"""
     # Create unique download directory for this thread
     thread_tmp_dir = TMP_DIR / f"thread_{thread_id}"
-    thread_tmp_dir.mkdir(exist_ok=True)
+    thread_tmp_dir.mkdir(exist_ok=True, parents=True)
     
     driver = None
+    profile_dir = None
     try:
-        driver = make_driver(thread_tmp_dir, driver_path, 
+        # Add a staggered delay based on thread_id to reduce initialization conflicts
+        time.sleep(thread_id * 0.5)
+        
+        driver, profile_dir = make_driver(thread_tmp_dir, driver_path, 
                            timeout=30 if args.slow else 15, 
                            thread_id=thread_id,
                            headless=args.headless)
@@ -293,11 +341,17 @@ def selenium_worker(work_queue: queue.Queue, result_queue: queue.Queue,
                 driver.quit()
             except Exception:
                 pass
-        # Clean up thread-specific temp directory
+        # Clean up thread-specific directories
         try:
             for f in thread_tmp_dir.glob("*"):
                 f.unlink()
             thread_tmp_dir.rmdir()
+        except Exception:
+            pass
+        try:
+            if profile_dir.exists():
+                import shutil
+                shutil.rmtree(profile_dir, ignore_errors=True)
         except Exception:
             pass
 
@@ -410,7 +464,23 @@ def main():
     
     if args.rescue and missing:
         print(f"\n🕷  Selenium second pass on {len(missing)} remaining URLs with {args.selenium_threads} parallel instances…")
-        drv_path = ChromeDriverManager().install()
+        
+        # Initialize ChromeDriver path once, with retry logic
+        drv_path = None
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                drv_path = ChromeDriverManager().install()
+                print(f"✅ ChromeDriver initialized: {drv_path}")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"⚠️  ChromeDriver initialization attempt {attempt + 1} failed, retrying...")
+                    time.sleep(2)
+                else:
+                    print(f"❌ ChromeDriver initialization failed after {max_retries} attempts: {e}")
+                    return
+        
         poll = 6
 
         # Set up parallel Selenium processing
