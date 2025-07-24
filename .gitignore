@@ -6,4 +6,6 @@
 !collect_urls.py
 !scraperv2.py
 !move_duplicates.py
+!find_bad_pdfs.py
+!robust_pdf_check.py
 !.gitignore
