@@ -5,4 +5,5 @@
 !pdf_scraper_threaded.py
 !collect_urls.py
 !scraperv2.py
+!move_duplicates.py
 !.gitignore
