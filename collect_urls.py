@@ -87,7 +87,8 @@ def main():
                     },
                     timeout=30
                 ).json()
-
+                print(js.get("results", []))
+                
                 for work in js.get("results", []):
                     if scanned >= args.max:
                         break
