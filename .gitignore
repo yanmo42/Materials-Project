@@ -9,4 +9,6 @@
 !find_bad_pdfs.py
 !robust_pdf_check.py
 !key.txt
+!plumber.py
+
 !.gitignore
