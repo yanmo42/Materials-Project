@@ -12,6 +12,8 @@ from pathlib import Path
 import requests
 from tqdm import tqdm
 from selenium.webdriver.chrome.service import Service
+import subprocess, shutil, platform
+
 
 # -------------------------------------------------------------------- #
 # constants
@@ -19,8 +21,8 @@ from selenium.webdriver.chrome.service import Service
 OPENALEX  = "https://api.openalex.org/works"
 UNPAYWALL = "https://api.unpaywall.org/v2/{}"
 
-OUT_DIR   = Path("ferro_papers")
-FAIL_DIR  = Path("failed_papers")           # zero‑byte markers for hard fails
+OUT_DIR   = Path("downloaded_pdfs1")
+FAIL_DIR  = Path("failed_downloads1")           # zero‑byte markers for hard fails
 TMP_DIR   = OUT_DIR / "_tmp"                # Selenium download folder
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -68,6 +70,52 @@ def try_direct(url: str, tgt: Path, timeout=30) -> bool:
     except Exception:
         return False
 
+
+def get_chrome_major() -> str:
+    """
+    Return the installed Chrome/Chromium/Brave major version.
+    Accepts override via $CHROME_VERSION.
+    """
+    import os, re, shutil, subprocess
+
+    if "CHROME_VERSION" in os.environ:
+        return os.environ["CHROME_VERSION"].split(".")[0]
+
+    # Brave first, then Chrome / Chromium
+    candidates = [
+        "brave-browser", "brave-browser-stable", "brave",  # Arch / Debian / misc
+        "google-chrome-stable", "google-chrome",
+        "chromium-browser", "chromium",
+        "chrome", "chrome.exe",
+    ]
+
+    for name in candidates:
+        path = shutil.which(name)
+        if not path:
+            continue
+        try:
+            out = subprocess.check_output([path, "--version"],
+                                           stderr=subprocess.STDOUT).decode()
+            # Brave prints e.g. "Brave Browser 126.1.66.101"
+            # Chrome prints "Google Chrome 126.0.6478.62"
+            # Chromium prints "Chromium 126.0.6478.0 Arch Linux"
+            m = re.search(r"\b(\d+)\.\d+\.\d+\.\d+\b", out)
+            if m:
+                # also return the binary path so we can set binary_location
+                return m.group(1), path
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        "Could not determine Chrome/Chromium/Brave version. "
+        "Install one of them or set CHROME_VERSION env var (e.g. 126)."
+    )
+
+
+
+
+
+
 # -------------------------------------------------------------------- #
 # first‑pass worker (direct only)
 # -------------------------------------------------------------------- #
@@ -114,6 +162,8 @@ COMMON_PDF_BUTTONS = [
 
 def make_driver(download_dir: Path, driver_path: str, timeout=45, thread_id=0, headless=False):
     """Thread-safe driver creation with initialization lock"""
+    chrome_major, brave_path = get_chrome_major()
+
     opts = uc.ChromeOptions()
     
     if headless:
@@ -162,21 +212,20 @@ def make_driver(download_dir: Path, driver_path: str, timeout=45, thread_id=0, h
         "download.prompt_for_download": False,
         "plugins.always_open_pdf_externally": True,
     })
-
+    
+    opts.binary_location = brave_path
     # Thread-safe driver initialization
     with DRIVER_INIT_LOCK:
         try:
             service = Service(executable_path=driver_path)
             drv = uc.Chrome(service=service, options=opts, version_main=None)
-            # Small delay to prevent rapid-fire initialization conflicts
             time.sleep(0.5)
         except Exception as e:
-            # If undetected_chromedriver fails, try a longer delay and retry once
-            time.sleep(2)
-            try:
-                drv = uc.Chrome(service=service, options=opts, version_main=None)
-            except Exception as e2:
-                raise Exception(f"Failed to initialize driver after retry: {e2}")
+            #  Print full traceback once so you SEE what's wrong
+            import traceback, sys
+            traceback.print_exc(file=sys.stderr)
+            # 2 Propagate → worker will notice and stop cleanly
+            raise RuntimeError(f"[Thread {thread_id}] driver init failed: {e}")
 
     drv.set_page_load_timeout(timeout)
     drv.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": UA})
@@ -466,22 +515,37 @@ def main():
         print(f"\n🕷  Selenium second pass on {len(missing)} remaining URLs with {args.selenium_threads} parallel instances…")
         
         # Initialize ChromeDriver path once, with retry logic
-        drv_path = None
+
+        
+
         max_retries = 3
+
+        chrome_major, brave_path = get_chrome_major()
+
         for attempt in range(max_retries):
             try:
-                drv_path = ChromeDriverManager().install()
-                print(f"✅ ChromeDriver initialized: {drv_path}")
+                try:  # first, ask for the matching major
+                    drv_path = ChromeDriverManager(
+                        driver_version=str(chrome_major)
+                        ).install()
+                except ValueError as e:
+                    if "No such driver version" in str(e):
+                        print(f"⚠️  {e}  → using latest available driver")
+                        drv_path = ChromeDriverManager().install()
+                    else:
+                        raise
+                print(f"✅ ChromeDriver installed → {drv_path}")
                 break
             except Exception as e:
                 if attempt < max_retries - 1:
-                    print(f"⚠️  ChromeDriver initialization attempt {attempt + 1} failed, retrying...")
+                    print(f"⚠️  attempt {attempt+1} failed → {e}; retrying…")
                     time.sleep(2)
                 else:
-                    print(f"❌ ChromeDriver initialization failed after {max_retries} attempts: {e}")
+                    print(f"❌ ChromeDriver init failed after {max_retries} tries → {e}")
                     return
+
         
-        poll = 6
+        poll = 10
 
         # Set up parallel Selenium processing
         work_queue = queue.Queue()

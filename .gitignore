@@ -1,14 +1,9 @@
 *
 !count_unique_papers.py
-!total_papers_available.py
-!pdfjson_conv.py
-!pdf_scraper_threaded.py
 !collect_urls.py
-!scraperv2.py
-!move_duplicates.py
-!find_bad_pdfs.py
-!robust_pdf_check.py
 !plumber.py
 !newtractor.py
+!requirements.txt
+!scraperv3.py
 
 !.gitignore

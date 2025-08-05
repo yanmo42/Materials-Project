@@ -12,7 +12,9 @@ from pathlib import Path
 import requests
 from tqdm import tqdm
 from selenium.webdriver.chrome.service import Service
+import undetected_chromedriver as uc
 
+driver_path = uc.install()
 # -------------------------------------------------------------------- #
 # constants
 # -------------------------------------------------------------------- #
@@ -101,7 +103,7 @@ def worker(q: queue.Queue, bar: tqdm, stats: dict, rescue_enabled: bool):
 # -------------------------------------------------------------------- #
 from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
-import undetected_chromedriver as uc
+
 
 COMMON_PDF_BUTTONS = [
     "Download PDF", "View PDF", "Full text PDF",
@@ -131,7 +133,11 @@ def make_driver(download_dir: Path, driver_path: str, timeout=45, thread_id=0, h
     })
 
     service = Service(executable_path=driver_path)
-    drv = uc.Chrome(service=service, options=opts)
+    drv = uc.Chrome(
+        driver_executable_path=driver_path,
+        service=service,
+        options=opts
+    )
 
 
     drv.set_page_load_timeout(timeout)
