@@ -28,6 +28,18 @@ HARDBLOCK  = {
     "sciencedirect.com","linkinghub.elsevier.com"
 }
 PDF_RE     = re.compile(r"https?://[^\"'<> ]+\.pdf(?:\?[^\"'<> ]*)?", re.I)
+
+# Common button texts to look for when trying to click a PDF link
+COMMON_PDF_BUTTONS = [
+    "Download PDF",
+    "View PDF",
+    "Full text PDF",
+    "Article PDF",
+    "Get PDF",
+    "PDF"
+]
+
+
 DRIVER_INIT_LOCK = threading.Lock()
 
 # -------------------------------------------------------------------- #
@@ -154,59 +166,89 @@ def make_driver(download_dir: Path, driver_path: str,
 # -------------------------------------------------------------------- #
 # Selenium worker with full debug & timing
 # -------------------------------------------------------------------- #
-def selenium_worker(work_queue: queue.Queue, result_queue: queue.Queue,
-                    driver_path: str, thread_id: int, args, poll: int):
-    thread_tmp = TMP_DIR/f"thread_{thread_id}"
+from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException
+import queue, traceback
+
+def selenium_worker(work_queue: queue.Queue,
+                    result_queue: queue.Queue,
+                    driver_path: str,
+                    thread_id: int,
+                    args,
+                    poll: int):
+    # prepare per-thread temp dir
+    thread_tmp = TMP_DIR / f"thread_{thread_id}"
     thread_tmp.mkdir(exist_ok=True, parents=True)
 
-    driver = None; profile_dir = None
+    # initialize driver
     try:
-        time.sleep(thread_id*1.5)
+        time.sleep(thread_id * 1.5)
         driver, profile_dir = make_driver(
-            thread_tmp, driver_path,
+            thread_tmp,
+            driver_path,
             timeout=45 if args.slow else 25,
-            thread_id=thread_id, headless=args.headless
+            thread_id=thread_id,
+            headless=args.headless
         )
         print(f"[T{thread_id}] initialized — queue size at start: {work_queue.qsize()}")
+    except Exception:
+        print(f"[T{thread_id}] Failed to init driver, exiting thread")
+        traceback.print_exc()
+        return
 
-        while True:
-            print(f"[T{thread_id}] waiting for work…")
-            item = work_queue.get(timeout=10)
-            if item is None:
-                print(f"[T{thread_id}] shutdown signal")
+    # main work loop: only exit when we get a None sentinel
+    while True:
+        try:
+            work_item = work_queue.get(timeout=10)
+            if work_item is None:
+                # clean shutdown signal
                 break
 
-            doi, year, urls = item
+            doi, year, urls = work_item
             doi_short = doi.split("/")[-1]
             print(f"[T{thread_id}] got work_item: {doi_short}")
+
             t0 = time.time()
             ok = False
-            attempts = []
+            attempts: list[str] = []
 
-            # clear old files
+            # clear out old downloads
             for f in thread_tmp.glob("*"):
                 try: f.unlink()
                 except: pass
 
+            # try each candidate URL
             for idx, url in enumerate(urls):
                 attempts.append(f"🔗 URL {idx+1}/{len(urls)}: {url[:80]}")
+
+                # 1) navigate with alert & timeout handling
                 try:
-                    st = time.time()
+                    start_nav = time.time()
                     driver.get(url)
-                    attempts.append(f"⏱ get() → {time.time()-st:.1f}s")
+                    nav_time = time.time() - start_nav
+                    attempts.append(f"⏱ get() → {nav_time:.1f}s")
+                except UnexpectedAlertPresentException:
+                    # dismiss site alert and skip this URL
+                    try:
+                        alert = driver.switch_to.alert
+                        alert.accept()
+                        attempts.append("⚠️ alert dismissed")
+                    except:
+                        pass
+                    continue
                 except TimeoutException:
                     attempts.append("⚠️ get() TIMEOUT")
                     continue
 
+                # allow page to stabilize
                 time.sleep(2)
                 html = driver.page_source
                 if args.verbose:
-                    (thread_tmp/f"debug_{thread_id}_{idx}.html")\
+                    (thread_tmp / f"debug_{thread_id}_{idx}.html")\
                         .write_text(html, encoding="utf-8")
 
-                # 1) click PDF buttons
+                # 2) attempt to click known PDF buttons
                 clicked = False
-                for text in ["Download PDF","View PDF","Full text PDF","PDF"]:
+                for text in COMMON_PDF_BUTTONS:
                     try:
                         els = driver.find_elements(By.XPATH,
                             f"//a[contains(normalize-space(),'{text}')]|"
@@ -217,44 +259,72 @@ def selenium_worker(work_queue: queue.Queue, result_queue: queue.Queue,
                                 attempts.append(f"🖱️ clicked “{text}”")
                                 clicked = True
                                 break
-                        if clicked: break
+                        if clicked:
+                            break
                     except Exception:
-                        pass
+                        continue
 
                 if clicked:
+                    # wait for download to start and complete
                     time.sleep(3)
+
                     for _ in range(poll):
                         pdf_list = list(thread_tmp.glob("*.pdf"))
                         if pdf_list and pdf_list[0].stat().st_size > 1024:
                             pdf_file = pdf_list[0]
-                            # capture size _before_ moving
+
+                            # 1) capture size before rename
                             size = pdf_file.stat().st_size
+                            size_kb = size / 1024
+                            # 2) move into your output folder
                             tgt = OUT_DIR / str(year) / f"{sha1(doi)}.pdf"
                             tgt.parent.mkdir(parents=True, exist_ok=True)
                             pdf_file.rename(tgt)
-                            # now log using the saved size
-                            attempts.append(f"✅ clicked-download saved ({size} bytes)")
-                            ok = True
-                            break
+
+                            # 3) validate magic header
+                            with open(tgt, "rb") as f:
+                                magic = f.read(4)
+
+                            if magic != b"%PDF":
+                                # Not a real PDF: delete and log failure
+                                tgt.unlink()
+                                ok = False
+                                print(f"[T{thread_id}] ⚠️ Invalid PDF header {magic!r}, deleting ({size} bytes)")
+                            else:
+                                # Valid PDF: report success and exact size
+                                ok = True
+                                print(f"[T{thread_id}] ✅ Valid PDF saved ({size_kb:.1f} KB)")
+
+                            # 4) break out if we got a valid PDF
+                            if ok:
+                                break
+
                         time.sleep(0.5)
+
+                    # exit the CLICK loop if successful
                     if ok:
                         break
 
 
-                # 2) fallback: scan HTML
+
+
+
+                # 3) fallback: extract any .pdf links from HTML
                 links = extract_pdf_from_html(html)
                 if links:
                     attempts.append(f"🔍 found {len(links)} links")
                     for link in links[:3]:
-                        if try_direct(link, OUT_DIR/str(year)/pdf_name(doi)):
+                        tgt = OUT_DIR / str(year) / f"{sha1(doi)}.pdf"
+                        if try_direct(link, tgt):
                             attempts.append("✅ direct link worked")
                             ok = True
                             break
-                    if ok: break
+                    if ok:
+                        break
 
-            duration = time.time()-t0
+            # record result
+            duration = time.time() - t0
             print(f"[T{thread_id}] DONE {doi_short} in {duration:.1f}s, success={ok}")
-
             result_queue.put({
                 'success': ok,
                 'doi': doi,
@@ -266,23 +336,32 @@ def selenium_worker(work_queue: queue.Queue, result_queue: queue.Queue,
             })
             work_queue.task_done()
 
-    except Exception:
-        import traceback
-        print(f"[T{thread_id}] UNCAUGHT EXCEPTION:")
-        traceback.print_exc()
+        except queue.Empty:
+            # no work; retry until we see the sentinel
+            continue
 
-    finally:
-        if driver:
-            try: driver.quit()
-            except: pass
-        for f in thread_tmp.glob("*"):
-            try: f.unlink()
-            except: pass
-        try: thread_tmp.rmdir()
+        except Exception:
+            # catch-all: log and keep thread alive
+            print(f"[T{thread_id}] UNCAUGHT EXCEPTION, skipping current job:")
+            traceback.print_exc()
+            # you may want to mark a failure here:
+            # result_queue.put({ 'success': False, ... })
+            continue
+
+    # cleanup on sentinel
+    try:
+        driver.quit()
+    except:
+        pass
+    # remove tmp files & profile
+    for f in thread_tmp.glob("*"):
+        try: f.unlink()
         except: pass
-        if profile_dir and profile_dir.exists():
-            shutil.rmtree(profile_dir, ignore_errors=True)
-        print(f"[T{thread_id}] cleaned up")
+    try: thread_tmp.rmdir()
+    except: pass
+    if profile_dir and profile_dir.exists():
+        shutil.rmtree(profile_dir, ignore_errors=True)
+    print(f"[T{thread_id}] cleaned up")
 
 
 # -------------------------------------------------------------------- #
@@ -324,6 +403,7 @@ def main():
     ap.add_argument("--max", type=int, default=1000)
     ap.add_argument("--threads", type=int, default=8, help="Threads for direct download phase")
     ap.add_argument("--selenium-threads", type=int, default=3, help="Number of parallel Selenium instances")
+    ap.add_argument("--only-selenium", action="store_true",  help="Skip direct-download phase and run only the Selenium rescue pass")
     grp = ap.add_mutually_exclusive_group()
     grp.add_argument("--rescue", dest="rescue", action="store_true", help="enable Selenium second pass (default)")
     grp.add_argument("--no-rescue", dest="rescue", action="store_false", help="skip Selenium pass")
@@ -413,19 +493,26 @@ def main():
             print("   Selenium rescue pass will be skipped.")
             args.rescue = False
 
-    # --- direct pass ---
-    stats = {"ok": 0, "miss": 0}; bar = tqdm(total=len(jobs), unit="pdf", desc="DIRECT", ncols=80)
-    q = queue.Queue()
-    for _ in range(min(args.threads, len(jobs))):
-        threading.Thread(target=worker, args=(q, bar, stats, args.rescue), daemon=True).start()
-    for j in jobs: q.put(j)
-    q.join(); bar.close()
 
-    first_pass_pdfs           = stats["ok"]          # how many PDFs we actually saved
-    first_pass_misses         = stats["miss"]        # direct downloads that failed
-    first_pass_not_downloaded = len(jobs) - first_pass_pdfs  # only shown when --no-rescue
+    if args.only_selenium:
+        args.rescue = True
+        missing = jobs[:]
+        print(f"⏩ Skipping direct download; will run Selenium on {len(missing)} jobs")
+        
+    else:
+        # --- direct pass ---
+        stats = {"ok": 0, "miss": 0}; bar = tqdm(total=len(jobs), unit="pdf", desc="DIRECT", ncols=80)
+        q = queue.Queue()
+        for _ in range(min(args.threads, len(jobs))):
+            threading.Thread(target=worker, args=(q, bar, stats, args.rescue), daemon=True).start()
+        for j in jobs: q.put(j)
+        q.join(); bar.close()
 
-    missing = [j for j in jobs if not (OUT_DIR / str(j[1]) / pdf_name(j[0])).exists()]
+        first_pass_pdfs           = stats["ok"]          # how many PDFs we actually saved
+        first_pass_misses         = stats["miss"]        # direct downloads that failed
+        first_pass_not_downloaded = len(jobs) - first_pass_pdfs  # only shown when --no-rescue
+
+        missing = [j for j in jobs if not (OUT_DIR / str(j[1]) / pdf_name(j[0])).exists()]
     
     if args.rescue and missing:
         print(f"\n🕷  Selenium second pass on {len(missing)} remaining URLs with {args.selenium_threads} parallel instances…")
@@ -510,11 +597,11 @@ def main():
         with tqdm(total=len(missing), unit="pdf", desc="SELENIUM") as pbar:
             processed = 0
             timeout_count = 0
-            max_timeouts = 5  # Allow some timeouts before giving up
+            max_timeouts = 3  # Allow some timeouts before giving up
             
             while processed < len(missing):
                 try:
-                    result = result_queue.get(timeout=15)  # 2 minute timeout
+                    result = result_queue.get(timeout=60)  # 2 minute timeout
                     processed += 1
                     timeout_count = 0  # Reset timeout counter on successful result
                     
@@ -546,12 +633,10 @@ def main():
                     
                 except queue.Empty:
                     timeout_count += 1
-                    print(f"⚠️  Timeout waiting for results ({timeout_count}/{max_timeouts}). {processed}/{len(missing)} completed.")
-                    
+                    print(f"⚠️  No results in 60s ({timeout_count}/{max_timeouts}) — {processed}/{len(missing)} done")
                     if timeout_count >= max_timeouts:
-                        print(f"❌ Too many timeouts, stopping Selenium processing")
+                        print("❌  Too many back‐to‐back waits, stopping early")
                         break
-                    
                     # Check if any threads are stil alive
                     alive_threads = sum(1 for t in selenium_threads if t.is_alive())
                     if alive_threads == 0:
