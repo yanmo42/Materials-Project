@@ -265,7 +265,7 @@ def selenium_worker(work_queue: queue.Queue,
                         continue
 
                 if clicked:
-                    # wait for download to start and complete
+                    # wait for the download to start
                     time.sleep(3)
 
                     for _ in range(poll):
@@ -273,41 +273,42 @@ def selenium_worker(work_queue: queue.Queue,
                         if pdf_list and pdf_list[0].stat().st_size > 1024:
                             pdf_file = pdf_list[0]
 
-                            # 1) capture size before rename
-                            size = pdf_file.stat().st_size
-                            size_kb = size / 1024
+                            # 1) capture size (bytes) before moving
+                            byte_size = pdf_file.stat().st_size
+                            kb_size = byte_size / 1024
+
                             # 2) move into your output folder
                             tgt = OUT_DIR / str(year) / f"{sha1(doi)}.pdf"
                             tgt.parent.mkdir(parents=True, exist_ok=True)
                             pdf_file.rename(tgt)
 
                             # 3) validate magic header
-                            with open(tgt, "rb") as f:
-                                magic = f.read(4)
-
-                            if magic != b"%PDF":
-                                # Not a real PDF: delete and log failure
-                                tgt.unlink()
+                            try:
+                                with open(tgt, "rb") as f:
+                                    magic = f.read(4)
+                            except Exception as e:
+                                print(f"[T{thread_id}] ⚠️ Could not open {tgt}: {e}")
                                 ok = False
-                                print(f"[T{thread_id}] ⚠️ Invalid PDF header {magic!r}, deleting ({size} bytes)")
                             else:
-                                # Valid PDF: report success and exact size
-                                ok = True
-                                print(f"[T{thread_id}] ✅ Valid PDF saved ({size_kb:.1f} KB)")
+                                if magic != b"%PDF":
+                                    # Invalid PDF: delete and log
+                                    tgt.unlink()
+                                    ok = False
+                                    print(f"[T{thread_id}] ⚠️ Invalid header {magic!r}, deleted ({kb_size:.1f} KB)")
+                                else:
+                                    ok = True
+                                    print(f"[T{thread_id}] ✅ Valid PDF saved ({kb_size:.1f} KB)")
 
-                            # 4) break out if we got a valid PDF
+                            # 4) break out if it really was a PDF
                             if ok:
                                 break
 
+                        # not ready yet—try again
                         time.sleep(0.5)
 
-                    # exit the CLICK loop if successful
+                    # exit the click-loop if we succeeded
                     if ok:
                         break
-
-
-
-
 
                 # 3) fallback: extract any .pdf links from HTML
                 links = extract_pdf_from_html(html)
@@ -316,9 +317,25 @@ def selenium_worker(work_queue: queue.Queue,
                     for link in links[:3]:
                         tgt = OUT_DIR / str(year) / f"{sha1(doi)}.pdf"
                         if try_direct(link, tgt):
-                            attempts.append("✅ direct link worked")
-                            ok = True
+                            # 1) capture size
+                            byte_size = tgt.stat().st_size
+                            kb_size   = byte_size / 1024
+
+                            # 2) validate magic header
+                            with open(tgt, "rb") as f:
+                                magic = f.read(4)
+
+                            if magic != b"%PDF":
+                                attempts.append(f"⚠️ Invalid header {magic!r}, deleting ({kb_size:.1f} KB)")
+                                tgt.unlink()
+                                ok = False
+                            else:
+                                attempts.append(f"✅ direct‐link PDF saved ({kb_size:.1f} KB)")
+                                print   (f"[T{thread_id}] ✅ direct link PDF saved ({kb_size:.1f} KB)")
+                                ok = True
+
                             break
+
                     if ok:
                         break
 
