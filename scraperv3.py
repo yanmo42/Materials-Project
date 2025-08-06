@@ -166,7 +166,7 @@ def make_driver(download_dir: Path, driver_path: str,
 # -------------------------------------------------------------------- #
 # Selenium worker with full debug & timing
 # -------------------------------------------------------------------- #
-from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException
+from selenium.common.exceptions import TimeoutException, UnexpectedAlertPresentException, WebDriverException, InvalidSessionIdException
 import queue, traceback
 
 def selenium_worker(work_queue: queue.Queue,
@@ -237,6 +237,33 @@ def selenium_worker(work_queue: queue.Queue,
                     continue
                 except TimeoutException:
                     attempts.append("⚠️ get() TIMEOUT")
+                    continue
+                 # ── NEW: heal crashed tabs ─────────────────────────────────────────────
+                except (InvalidSessionIdException, WebDriverException) as e:
+                    msg = (e.msg or "").lower()
+                    # restart if the browser itself died
+                    if any(t in msg for t in ("tab crashed", "chrome not reachable",
+                                            "devtoolsactiveport", "invalid session")):
+                        attempts.append(f"⚠️ {msg[:60]} — restarting driver")
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        try:
+                            driver, profile_dir = make_driver(thread_tmp, driver_path,
+                                                            timeout=45 if args.slow else 25,
+                                                            thread_id=thread_id,
+                                                            headless=args.headless)
+                        except Exception as new_e:
+                            attempts.append(f"❌ could not restart driver: {new_e}")
+                            break          # give up on this DOI
+                        continue           # retry same DOI
+                    else:
+                        attempts.append(f"⚠️ WebDriver error: {msg[:60]}")
+                        continue
+
+                except OSError as e:          # disk / permission errors
+                    attempts.append(f"⚠️ OS error: {e}")
                     continue
 
                 # allow page to stabilize
@@ -614,11 +641,11 @@ def main():
         with tqdm(total=len(missing), unit="pdf", desc="SELENIUM") as pbar:
             processed = 0
             timeout_count = 0
-            max_timeouts = 3  # Allow some timeouts before giving up
+            max_timeouts = 30  # Allow some timeouts before giving up
             
             while processed < len(missing):
                 try:
-                    result = result_queue.get(timeout=60)  # 2 minute timeout
+                    result = result_queue.get(timeout=120)  # 2 minute timeout
                     processed += 1
                     timeout_count = 0  # Reset timeout counter on successful result
                     
