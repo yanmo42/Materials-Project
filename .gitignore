@@ -5,5 +5,6 @@
 !newtractor.py
 !requirements.txt
 !scraperv3.py
-
+!match_cifs.py
+!mp_fetch_cifs.py
 !.gitignore
