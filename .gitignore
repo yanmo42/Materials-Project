@@ -7,4 +7,5 @@
 !scraperv3.py
 !match_cifs.py
 !mp_fetch_cifs.py
+!mineru_batch.py
 !.gitignore

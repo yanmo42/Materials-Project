@@ -17,8 +17,8 @@ from webdriver_manager.chrome import ChromeDriverManager
 # -------------------------------------------------------------------- #
 OPENALEX   = "https://api.openalex.org/works"
 UNPAYWALL  = "https://api.unpaywall.org/v2/{}"
-OUT_DIR    = Path("downloaded_pdfs")
-FAIL_DIR   = Path("failed_downloads")
+OUT_DIR    = Path("downloaded-pdfs")
+FAIL_DIR   = Path("failed-downloads")
 TMP_DIR    = OUT_DIR / "_tmp"
 UA         = ("Mozilla/5.0 (X11; Linux x86_64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
