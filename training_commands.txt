@@ -1,0 +1,68 @@
+python train_cgcnn.py \
+  --splits splits \
+  --outdir runs/cgcnn_aggr100_cap128x8_cut8_ng60 \
+  --device cuda \
+  --epochs 100 \
+  --batch-size 64 \
+  --lr 7e-4 \
+  --cutoff 8.0 \
+  --n-gauss 60 \
+  --layers 8 \
+  --emb-dim 128 \
+  --dropout 0.15 \
+  --normalize-target \
+  --workers 4
+
+
+python train_cgcnn.py \
+  --splits splits \
+  --outdir runs/cgcnn_aggr100_cut9_ng80 \
+  --device cuda \
+  --epochs 100 \
+  --batch-size 48 \
+  --lr 8e-4 \
+  --cutoff 9.0 \
+  --n-gauss 80 \
+  --layers 6 \
+  --emb-dim 128 \
+  --dropout 0.1 \
+  --normalize-target \
+  --workers 6
+
+
+
+
+python train_cgcnn.py \
+  --splits splits \
+  --outdir runs/cgcnn_reg100_drop20 \
+  --device cuda \
+  --epochs 100 \
+  --batch-size 64 \
+  --lr 1e-3 \
+  --cutoff 7.0 \
+  --n-gauss 60 \
+  --layers 6 \
+  --emb-dim 128 \
+  --dropout 0.2 \
+  --normalize-target \
+  --workers 4
+
+
+
+for s in 1 2 3 4 5; do
+  python train_cgcnn.py \
+    --splits splits \
+    --outdir runs/cgcnn_ens_s${s} \
+    --device cuda \
+    --epochs 100 \
+    --batch-size 64 \
+    --lr 1e-3 \
+    --cutoff 7.0 \
+    --n-gauss 60 \
+    --layers 6 \
+    --emb-dim 128 \
+    --dropout 0.1 \
+    --normalize-target \
+    --workers 4 \
+    --seed $s
+done
