@@ -9,4 +9,6 @@
 !link_cifs_mp.py
 !tc_cleaner.py
 !train_cgcnn.py
+!analyze_cgcnn_run.py
+!make_splits.py
 !.gitignore
