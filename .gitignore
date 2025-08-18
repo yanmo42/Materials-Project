@@ -5,7 +5,8 @@
 !newtractor.py
 !requirements.txt
 !scraperv3.py
-!match_cifs.py
-!mp_fetch_cifs.py
 !mineru_batch.py
+!link_cifs_mp.py
+!tc_cleaner.py
+!train_cgcnn.py
 !.gitignore
